@@ -1,8 +1,7 @@
-"""SQLite session storage — schema, inserts, and history queries."""
+"""SQLite session storage — upgraded to persist eval_scores and claim_checks."""
 
 import json
 import logging
-import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -15,11 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 def _get_connection() -> sqlite3.Connection:
-    """Return a SQLite connection, creating the DB file and schema if needed."""
     settings = get_settings()
     db_path = Path(settings.database_url)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     _create_schema(conn)
@@ -27,18 +24,26 @@ def _get_connection() -> sqlite3.Connection:
 
 
 def _create_schema(conn: sqlite3.Connection) -> None:
-    """Ensure the sessions table exists."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sessions (
-            id          TEXT PRIMARY KEY,
-            question    TEXT NOT NULL,
-            summary     TEXT,
-            final_answer TEXT,
-            sources     TEXT,       -- JSON array
-            retry_count INTEGER DEFAULT 0,
+            id                TEXT PRIMARY KEY,
+            question          TEXT NOT NULL,
+            sub_queries       TEXT,           -- JSON array
+            summary           TEXT,
+            final_answer      TEXT,
+            sources           TEXT,           -- JSON array
+            verified_sources  TEXT,           -- JSON array of SourceVerification
+            claim_checks      TEXT,           -- JSON array of ClaimCheck
+            retry_count       INTEGER DEFAULT 0,
             validation_status TEXT,
-            created_at  TEXT NOT NULL
+            eval_faithfulness REAL,
+            eval_relevancy    REAL,
+            eval_precision    REAL,
+            eval_recall       REAL,
+            eval_coverage     REAL,
+            eval_overall      REAL,
+            created_at        TEXT NOT NULL
         )
         """
     )
@@ -46,41 +51,46 @@ def _create_schema(conn: sqlite3.Connection) -> None:
 
 
 def save_session(state: dict[str, Any]) -> str:
-    """
-    Persist a completed research session to SQLite.
-
-    Args:
-        state: The final LangGraph ResearchState dict.
-
-    Returns:
-        The UUID session ID.
-    """
+    """Persist a completed research session. Returns UUID session ID."""
     session_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    sources_json = json.dumps(state.get("sources", []))
+    eval_scores = state.get("eval_scores") or {}
 
     conn = _get_connection()
     try:
         conn.execute(
             """
-            INSERT INTO sessions
-                (id, question, summary, final_answer, sources, retry_count, validation_status, created_at)
-            VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (
+                id, question, sub_queries, summary, final_answer,
+                sources, verified_sources, claim_checks,
+                retry_count, validation_status,
+                eval_faithfulness, eval_relevancy, eval_precision,
+                eval_recall, eval_coverage, eval_overall,
+                created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 session_id,
                 state.get("question", ""),
+                json.dumps(state.get("sub_queries", [])),
                 state.get("summary", ""),
                 state.get("final_answer", ""),
-                sources_json,
+                json.dumps(state.get("sources", [])),
+                json.dumps(state.get("verified_sources", [])),
+                json.dumps(state.get("claim_checks", [])),
                 state.get("retry_count", 0),
                 state.get("validation_status", ""),
+                eval_scores.get("faithfulness"),
+                eval_scores.get("answer_relevancy"),
+                eval_scores.get("context_precision"),
+                eval_scores.get("context_recall"),
+                eval_scores.get("source_coverage"),
+                eval_scores.get("overall_score"),
                 now,
             ),
         )
         conn.commit()
-        logger.info("Session %s saved to database.", session_id)
+        logger.info("Session %s saved.", session_id)
     except sqlite3.Error as exc:
         logger.error("Failed to save session: %s", exc)
         raise
@@ -91,7 +101,7 @@ def save_session(state: dict[str, Any]) -> str:
 
 
 def get_all_sessions(limit: int = 50) -> list[dict[str, Any]]:
-    """Return the most recent research sessions."""
+    """Return most recent sessions with parsed JSON fields."""
     conn = _get_connection()
     try:
         cursor = conn.execute(
@@ -101,7 +111,9 @@ def get_all_sessions(limit: int = 50) -> list[dict[str, Any]]:
         result = []
         for row in rows:
             d = dict(row)
-            d["sources"] = json.loads(d.get("sources") or "[]")
+            for field in ("sub_queries", "sources", "verified_sources", "claim_checks"):
+                raw = d.get(field)
+                d[field] = json.loads(raw) if raw else []
             result.append(d)
         return result
     finally:
@@ -109,7 +121,7 @@ def get_all_sessions(limit: int = 50) -> list[dict[str, Any]]:
 
 
 def get_session(session_id: str) -> dict[str, Any] | None:
-    """Return a single session by ID, or None if not found."""
+    """Return single session by ID with parsed JSON fields."""
     conn = _get_connection()
     try:
         cursor = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
@@ -117,7 +129,29 @@ def get_session(session_id: str) -> dict[str, Any] | None:
         if row is None:
             return None
         d = dict(row)
-        d["sources"] = json.loads(d.get("sources") or "[]")
+        for field in ("sub_queries", "sources", "verified_sources", "claim_checks"):
+            raw = d.get(field)
+            d[field] = json.loads(raw) if raw else []
         return d
+    finally:
+        conn.close()
+
+
+def get_eval_trends(limit: int = 30) -> list[dict[str, Any]]:
+    """Return evaluation score trends for charting."""
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            SELECT created_at, eval_faithfulness, eval_relevancy,
+                   eval_precision, eval_recall, eval_coverage, eval_overall
+            FROM sessions
+            WHERE eval_overall IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
     finally:
         conn.close()

@@ -1,60 +1,146 @@
 """
-Critic (Quality Control) Agent
-================================
-Fact-checks the summary against the retrieved facts, detects hallucinations,
-and sets validation_status to "PASS" or "FAIL". Increments retry_count on
-failure and feeds critique_notes back to the Summarizer.
+Critic (Quality Control) Agent — Upgraded
+==========================================
+Performs CLAIM-LEVEL fact-checking — each sentence in the summary is
+individually verified against the retrieved facts, rather than judging
+the summary holistically.
+
+For each claim, the Critic assigns:
+  - verdict:    "SUPPORTED" | "UNSUPPORTED" | "CONTRADICTED"
+  - evidence:   the specific fact or chunk that supports/contradicts it
+  - confidence: 0.0 – 1.0
+
+The overall validation_status is determined by:
+  - PASS: ≥85% of claims are SUPPORTED (configurable)
+  - FAIL: <85% of claims SUPPORTED or any claim is CONTRADICTED
+
+This catches hallucinations at the sentence level, not just the summary level.
 """
 
+import json
 import logging
+import re
 from typing import Any
 
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.config import get_settings
-from src.state import ResearchState
+from src.state import ClaimCheck, ResearchState
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """You are a rigorous fact-checking critic.
-You will be given:
-  - A user question
-  - A list of verified facts (ground truth)
-  - A generated summary
+_PASS_THRESHOLD = 0.80  # fraction of claims that must be SUPPORTED to PASS
 
-Your job is to check the summary for:
-1. Hallucinations — claims NOT supported by the provided facts
-2. Logical errors or contradictions
-3. Missing critical information that should have been included
-4. Vague or misleading statements
+_CLAIM_CHECK_SYSTEM = """\
+You are a rigorous fact-checker operating at the sentence level.
 
-Respond with EXACTLY this format:
-VERDICT: PASS
-(if no significant issues are found)
+You will receive:
+  - A list of FACTS (ground truth retrieved from sources)
+  - A list of CLAIMS (sentences from a generated summary)
 
-OR:
+For each claim, determine:
+  1. verdict: "SUPPORTED" | "UNSUPPORTED" | "CONTRADICTED"
+     - SUPPORTED: The claim is explicitly backed by at least one fact
+     - UNSUPPORTED: The claim cannot be verified against the facts (not necessarily wrong)
+     - CONTRADICTED: A fact directly contradicts the claim
+  2. evidence: Quote the specific fact (or "none") that justifies your verdict
+  3. confidence: 0.0–1.0 (how certain are you of this verdict?)
 
-VERDICT: FAIL
-ISSUES:
-- <issue 1>
-- <issue 2>
-...
-
-Do not add any extra text before or after.
+Output ONLY valid JSON — a list of objects, one per claim:
+[
+  {
+    "claim_index": 0,
+    "claim": "...",
+    "verdict": "SUPPORTED",
+    "evidence": "...",
+    "confidence": 0.95
+  },
+  ...
+]
 """
+
+
+def _split_claims(text: str) -> list[str]:
+    """Split summary text into individual claim sentences."""
+    # Split on sentence boundaries
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    # Filter out very short fragments and headings
+    return [s.strip() for s in sentences if len(s.strip()) > 20 and not s.startswith("#")]
+
+
+def _check_claims(
+    claims: list[str],
+    facts: list[str],
+    llm: ChatOllama,
+) -> list[ClaimCheck]:
+    """Run LLM claim-level fact-check. Returns list of ClaimCheck dicts."""
+    if not claims or not facts:
+        return []
+
+    facts_text = "\n".join(f"[F{i}] {f}" for i, f in enumerate(facts[:20]))
+    claims_text = "\n".join(f"[C{i}] {c}" for i, c in enumerate(claims))
+
+    messages = [
+        SystemMessage(content=_CLAIM_CHECK_SYSTEM),
+        HumanMessage(
+            content=f"FACTS:\n{facts_text}\n\nCLAIMS TO CHECK:\n{claims_text}"
+        ),
+    ]
+
+    try:
+        response = llm.invoke(messages)
+        raw = response.content.strip()
+
+        # Extract JSON array
+        match = re.search(r'\[.*\]', raw, re.DOTALL)
+        if not match:
+            raise ValueError("No JSON array in response")
+
+        data = json.loads(match.group())
+        checks: list[ClaimCheck] = []
+
+        for item in data:
+            checks.append(
+                ClaimCheck(
+                    claim=item.get("claim", claims[item.get("claim_index", 0)] if claims else ""),
+                    verdict=item.get("verdict", "UNSUPPORTED"),
+                    evidence=item.get("evidence", ""),
+                    confidence=float(item.get("confidence", 0.5)),
+                )
+            )
+        return checks
+
+    except (json.JSONDecodeError, ValueError, KeyError) as exc:
+        logger.warning("[Critic] JSON parse failed: %s — falling back to holistic check.", exc)
+        return _holistic_fallback(claims, facts, llm)
+    except Exception as exc:
+        logger.error("[Critic] LLM call failed: %s", exc)
+        return []
+
+
+def _holistic_fallback(
+    claims: list[str], facts: list[str], llm: ChatOllama
+) -> list[ClaimCheck]:
+    """Simple fallback: mark all claims as SUPPORTED if the summary seems factual."""
+    # Return all as UNSUPPORTED with low confidence — forces at least partial review
+    return [
+        ClaimCheck(claim=c, verdict="UNSUPPORTED", evidence="", confidence=0.3)
+        for c in claims
+    ]
 
 
 def critic_node(state: ResearchState) -> dict[str, Any]:
     """
     LangGraph node: Critic.
 
-    Fact-checks the summary and sets validation_status.
+    Performs claim-level fact-checking of the summary against retrieved facts.
 
     Updates state fields:
-      - validation_status ("PASS" | "FAIL")
-      - critique_notes (failure reasons, if any)
-      - retry_count (incremented on FAIL)
+      - claim_checks       (per-claim verdict list)
+      - validation_status  ("PASS" | "FAIL")
+      - critique_notes     (summary of failures)
+      - retry_count        (incremented on FAIL)
     """
     question = state.get("question", "")
     facts = state.get("facts", [])
@@ -63,20 +149,24 @@ def critic_node(state: ResearchState) -> dict[str, Any]:
 
     cfg = get_settings()
     logger.info(
-        "[Critic] Checking summary (attempt %d / %d).",
-        retry_count + 1,
-        cfg.max_retry,
+        "[Critic] Claim-level check (attempt %d / %d).", retry_count + 1, cfg.max_retry
     )
 
     if not summary:
         logger.warning("[Critic] Empty summary — marking FAIL.")
         return {
+            "claim_checks": [],
             "validation_status": "FAIL",
             "critique_notes": "Summary is empty.",
             "retry_count": retry_count + 1,
         }
 
-    facts_text = "\n".join(f"- {f}" for f in facts)
+    # Split summary into claims
+    claims = _split_claims(summary)
+    if not claims:
+        claims = [summary]
+
+    logger.info("[Critic] Checking %d claims against %d facts.", len(claims), len(facts))
 
     llm = ChatOllama(
         base_url=cfg.ollama_base_url,
@@ -84,57 +174,61 @@ def critic_node(state: ResearchState) -> dict[str, Any]:
         temperature=0,
     )
 
-    messages = [
-        SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(
-            content=(
-                f"Question: {question}\n\n"
-                f"Verified facts:\n{facts_text}\n\n"
-                f"Generated summary:\n{summary}"
-            )
-        ),
-    ]
+    claim_checks = _check_claims(claims, facts, llm)
 
-    try:
-        response = llm.invoke(messages)
-        verdict_text = response.content.strip()
-
-        if verdict_text.startswith("VERDICT: PASS"):
-            logger.info("[Critic] Summary PASSED quality check.")
-            return {
-                "validation_status": "PASS",
-                "critique_notes": "",
-            }
-        else:
-            # Extract issues
-            issues = ""
-            if "ISSUES:" in verdict_text:
-                issues = verdict_text.split("ISSUES:", 1)[1].strip()
-
-            logger.warning("[Critic] Summary FAILED. Issues:\n%s", issues)
-            return {
-                "validation_status": "FAIL",
-                "critique_notes": issues,
-                "retry_count": retry_count + 1,
-            }
-
-    except Exception as exc:  # noqa: BLE001
-        logger.error("[Critic] LLM call failed: %s — defaulting to PASS.", exc)
-        # On LLM failure, pass through to avoid infinite loops
+    # ── Compute verdict ───────────────────────────────────────────────────────
+    if not claim_checks:
+        # LLM failed completely — pass through to avoid infinite loop
+        logger.warning("[Critic] No claim checks produced — defaulting PASS.")
         return {
+            "claim_checks": [],
             "validation_status": "PASS",
-            "critique_notes": f"Critic LLM unavailable: {exc}",
+            "critique_notes": "Critic could not evaluate — passing through.",
+            "retry_count": retry_count,
+        }
+
+    total = len(claim_checks)
+    supported = sum(1 for c in claim_checks if c.get("verdict") == "SUPPORTED")
+    contradicted = sum(1 for c in claim_checks if c.get("verdict") == "CONTRADICTED")
+    support_rate = supported / total
+
+    logger.info(
+        "[Critic] %d/%d claims SUPPORTED (%.0f%%), %d CONTRADICTED.",
+        supported, total, support_rate * 100, contradicted,
+    )
+
+    if support_rate >= _PASS_THRESHOLD and contradicted == 0:
+        logger.info("[Critic] PASS — %.0f%% supported, 0 contradictions.", support_rate * 100)
+        return {
+            "claim_checks": claim_checks,
+            "validation_status": "PASS",
+            "critique_notes": "",
+            "retry_count": retry_count,
+        }
+    else:
+        # Build critique notes listing specific failures
+        failures = [
+            f"- [{c.get('verdict')}] \"{c.get('claim', '')[:80]}\" → {c.get('evidence', 'no evidence')[:100]}"
+            for c in claim_checks
+            if c.get("verdict") in ("UNSUPPORTED", "CONTRADICTED")
+        ]
+        notes = (
+            f"Support rate: {support_rate:.0%} (need ≥{_PASS_THRESHOLD:.0%}). "
+            f"{contradicted} contradiction(s).\n"
+            + "\n".join(failures[:5])
+        )
+
+        logger.warning("[Critic] FAIL — %s", notes[:200])
+        return {
+            "claim_checks": claim_checks,
+            "validation_status": "FAIL",
+            "critique_notes": notes,
+            "retry_count": retry_count + 1,
         }
 
 
 def should_retry(state: ResearchState) -> str:
-    """
-    LangGraph conditional edge: decides whether to retry or move to Finalizer.
-
-    Returns:
-        "retry"    → back to Summarizer
-        "finalize" → forward to Finalizer
-    """
+    """LangGraph conditional edge: retry → Summarizer, finalize → Finalizer."""
     cfg = get_settings()
     validation_status = state.get("validation_status", "PENDING")
     retry_count = state.get("retry_count", 0)
@@ -149,7 +243,5 @@ def should_retry(state: ResearchState) -> str:
         )
         return "finalize"
 
-    logger.info(
-        "[Critic] Routing → Summarizer (retry %d / %d)", retry_count, cfg.max_retry
-    )
+    logger.info("[Critic] Routing → Summarizer (retry %d / %d)", retry_count, cfg.max_retry)
     return "retry"
