@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: ai-research-assistant
+    runtime: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    region: oregon
+    envVars:
+      - key: OLLAMA_BASE_URL
+        value: http://localhost:11434
+      - key: OLLAMA_MODEL
+        value: llama3.2:3b
+      - key: CHROMA_PERSIST_DIR
+        value: /app/data/chroma
+      - key: DATABASE_URL
+        value: /app/data/sessions.db
+      - key: TAVILY_API_KEY
+        sync: false
