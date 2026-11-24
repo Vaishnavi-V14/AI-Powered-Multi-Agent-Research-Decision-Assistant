@@ -1,0 +1,94 @@
+version: "3.9"
+
+services:
+  # ── Ollama LLM Sidecar ───────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: research_ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ── Model Puller (runs once to download llama3.2:3b) ─────────────────────
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: research_ollama_pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        ollama pull llama3.2:3b &&
+        ollama pull nomic-embed-text
+      "
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    restart: "no"
+
+  # ── Streamlit App ─────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: research_app
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2:3b
+      - CHROMA_PERSIST_DIR=/app/data/chroma
+      - DATABASE_URL=/app/data/sessions.db
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - MAX_RETRY=3
+      - LOG_LEVEL=INFO
+    volumes:
+      - app_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ── FastAPI Server ────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: research_api
+    depends_on:
+      ollama:
+        condition: service_healthy
+    command: >
+      uvicorn app.api:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 2
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2:3b
+      - CHROMA_PERSIST_DIR=/app/data/chroma
+      - DATABASE_URL=/app/data/sessions.db
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - MAX_RETRY=3
+    volumes:
+      - app_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  app_data:
